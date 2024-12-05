@@ -1,0 +1,763 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2155
+# shellcheck disable=SC2034
+set -u
+trap cleanup SIGINT SIGTERM ERR EXIT
+declare -r script_version="1.21"
+# -----------------------------------------------------------------------------
+#                     One tool to rule them all, one tool to containerize them
+#                   One tool to bring them all, and in the namespace bind them
+#                                  In the Land of Mordor where the shadows lie
+#                                        _
+#                            ___ ___ ___| |_ ___ _ _ 
+#                           |_ -| -_|  _| . | . |_'_|
+#                           |___|___|___|___|___|_,_|
+#
+# Author
+# ~~~~~~
+#   Gianluca Gabrielli
+#   ggabrielli@suse.de
+#
+# Description
+# ~~~~~~~~~~~
+#   Secbox is a toolbox that provides an out-of-the-box working setup for your
+#   daily work in the SUSE Security Team.
+#
+#   It does not only manage the toolset but it also takes care of mounting the
+#   required NFS exports via sshfs. Think at this as a portable workstation
+#   setup. It makes hard use of Podman as container engine, so make sure it's
+#   installed on your machine and configured to run rootless. Your home directory
+#   will be mounted as home directory within the container, this makes all your
+#   dotfiles accessible from the preinstalled tools. The first time you run
+#   this script the container will be created. The best way to use this script
+#   from your terminal is by leveraging aliases. Use 'secbox --alias' to get a
+#   list of suggested ones.
+#
+#   This tool is only intended for people with access to the SUSE internal
+#   network.
+#
+# Dependency
+# ~~~~~~~~~~
+#   * podman
+#   * curl
+#   * systemd
+#
+# -----------------------------------------------------------------------------
+
+print_help() {
+    cat <<EOF
+Usage: ${script_name} [--debug] [-h] [-v] [--sshfs] [--destroy <-f> <-i>] [--root] \\
+                [--interactive|--no-interactive] [--tty|--no-tty] \\
+                [--no-color] [--alias] command [arg1 arg2...] \\
+                [--update-container <-f|--force>]
+
+A collection of needed tools for your daily work in the Security Team.
+For more information: https://github.com/StayPirate/secbox
+
+Available options:
+
+--sshfs             Makes dist:/mounts and dist:/suse available to the container.
+                    In order to works you should be able to access dist.suse.de via ssh
+                    from your host system by simply run 'ssh dist', without interaction
+                    You can find an example stanza in the README.md of this project.
+                    ${script_name} supports ssh-agent out-of-the-box if it's configured
+                    in the host system.
+--destroy           Destroy ${container} container and related components
+    [-i]            Also delete the container image
+    [-f]            Not interactive, [Y]es by default
+--root              Enter the running container as root user. Container debug mode
+--debug             Script debug mode
+--update-container  Destroy the current container, download the new image and recrate it
+    [-f,--force]    Force the update with the latest remote image built regardless of its
+                    version
+--no-color          Turn off colored output
+--alias             Print a list of useful aliases, you can add it to your .bashrc
+--tty               Force terminal
+--no-tty            Disable terminal
+--interactive       Force interactive shell
+--no-interactive    Disable interactive shell
+-h, --help          Print this help and exit
+-v, --version       Print component versions
+EOF
+}
+
+print_logo() {
+    msg "${red}\
+                _
+    ___ ___ ___| |_ ___ _ _
+   |_ -| -_|  _| . | . |_'_|
+   |___|___|___|___|___|_,_|
+        ${no_format}"
+}
+
+declare -r tmp_dir=${XDG_RUNTIME_DIR:-/tmp}
+declare -r container="secbox"
+declare -r script_name=$(basename "${BASH_SOURCE[0]}")
+declare -r local_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/${container}"
+declare -r resolv_conf="${local_data_dir}/resolv.conf"
+declare -r host_env="${local_data_dir}/host-env"
+declare -r registry="registry.suse.de"
+declare -r registry_api="https://${registry}/v2/"
+declare -r image_name="non_public/maintenance/security/container/containers/secbox"
+declare -r local_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/${container}"
+declare -r container_unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${container}.service"
+declare -ar host_env_vars=(
+### List of environment variables to copy from the host at each run
+    "SSH_AUTH_SOCK"
+    "DBUS_SESSION_BUS_ADDRESS"
+    "LANG"
+)
+declare -ar extra_env_vars=(
+### List of initialized environment variables you want to find inside the container
+    "TERM=xterm-256color"
+    "COLORTERM=truecolor"
+    "PYTHONPATH=/opt/imtools"
+    "PYTHONNOUSERSITE=true"
+)
+
+create_base_structure() {
+    [[ -d "${local_config_dir}" ]] || mkdir -p "${local_config_dir}"
+    [[ -d "${local_data_dir}" ]] || mkdir -p "${local_data_dir}"
+    [[ -f "${resolv_conf}" ]] || echo -n > "$resolv_conf"
+    [[ -f "${host_env}" ]] || echo -n > "$host_env"
+}
+
+remove_base_structure() {
+    [[ -d "${local_data_dir}" ]] && rm -rf "${local_data_dir}"
+    [[ -f "${resolv_conf}" ]] && rm "$resolv_conf"
+    [[ -f "${host_env}" ]] && rm "$host_env"
+}
+
+cleanup() {
+    trap - SIGINT SIGTERM ERR EXIT
+
+    # Umount SSHFS if was enabled
+    if [[ -n ${sshfs_flag:-} ]]; then
+        if sshfs_is_mounted; then
+            # Check if a parallel secbox instance is using sshfs, if yes do not umount
+            if [[ $(secbox_instances_using_sshfs) -le 3 ]]; then
+                sshfs_umount &&
+                    msg_to_secbox_sessions "==== Another ${script_name} instance has umounted dist:/mounts in /mounts ===="
+            fi
+        fi
+    fi
+}
+
+print_version() {
+    local _version_str="script\t:\t${script_name}\tv.${script_version}"
+    if secbox_container_exists; then
+        local _image_version=$(local_image_container_version)
+        local _container_status=$(podman container inspect --format '{{.State.Status}}' ${container} 2>/dev/null)
+        _version_str="${_version_str}\nimage\t:\t${image_name}\tv.${_image_version}"
+        _version_str="${_version_str}\ncontainer\t:\t${container}\t${_container_status}"
+    fi
+    echo -e "${_version_str}" | column -t -s $'\t'
+}
+
+setup_colors() {
+    no_format='' red='' green='' orange='' blue='' purple='' cyan='' yellow=''
+    if [[ -t 2 ]] && [[ -z "${no_color:-}" ]] && [[ "${TERM:-}" != "dumb" ]]; then
+        no_format='\033[0m'
+        red='\033[0;31m'
+        green='\033[0;32m'
+        orange='\033[0;33m'
+        blue='\033[0;34m'
+        purple='\033[0;35m'
+        cyan='\033[0;36m'
+        yellow='\033[0;33m'
+    fi
+}
+
+msg() {
+    echo >&2 -e "${1:-}"
+}
+
+die() {
+    local _msg=${1:-}
+    local _code=${2:-1} # default exit status 1
+    [[ -z $_msg ]] || msg "$_msg"
+    exit "$_code"
+}
+
+msg_to_secbox_sessions() {
+    secbox_container_exists || return
+
+    local _pts
+    for _pts in $(podman container exec $container find /dev/pts/ -maxdepth 1 -regex '^/dev/pts/[0-9]+$'); do
+        echo "$_pts" | grep -E "/dev/pts/[0-9]+" > /dev/null 2>&1 &&
+            podman 2>/dev/null container exec $container sh -c "echo \"$*\" > \"$_pts\""
+    done
+}
+
+aliases() {
+    echo "\
+if [ -z \$secbox_container_id ] && [ ! -f /run/.containerenv ]; then
+    ########## NOT INSIDE THE CONTAINER ##########
+    ### OBS/IBS/PBS/BBS
+    # OBS: https://build.opensuse.org/
+    alias osc='${script_name} osc -A https://api.opensuse.org'
+    # IBS: https://build.suse.de/
+    alias isc='${script_name} osc -A https://api.suse.de'
+    # PBS: https://build.prv.suse.net/
+    alias psc='${script_name} osc -A https://api.prv.suse.net'
+    # BBS: https://build.suse.asia/
+    alias bsc='${script_name} osc -A https://api.suse.asia'
+    alias is_maintained='${script_name} is_maintained'
+    alias quilt='${script_name} quilt'
+    alias oscsd='osc service localrun download_files'
+    alias oscb='osc build --ccache --cpio-bulk-download --download-api-only'
+    alias bugzilla='${script_name} bugzilla'
+    alias insect='${script_name} insect'
+    # Which package depends on SUSE:SLE-12:GA/Botan?
+    # isc whatdependson SUSE:SLE-12:GA Botan standard x86_64
+    alias dep_on='isc whatdependson'
+
+    ### UM: Kernel updates
+    alias prepare-submission='${script_name} prepare-submission.rb'
+    alias prepare-kgraft='${script_name} prepare-kgraft.rb'
+    alias submit-kgraft='${script_name} submit-kgraft.pl'
+    alias kernel-livepatch-signing-email-for-autobuild='${script_name} kernel-livepatch-signing-email-for-autobuild.py'
+    alias kern-cve='${script_name} kern-cve.sh'
+    alias cved='${script_name} cve-desc.sh'
+
+    ### Internal Tools (reactive)
+    alias mtk='${script_name} mtk'
+    alias gitkern='${script_name} gitkern'
+    alias im='secbox python3.11 -m imtools.im'
+
+    ### Internal Tools (proactive)
+    alias audit_report='${script_name} audit_report.py'
+
+    ### Internal Tools (generic)
+    alias foodchain='${script_name} --sshfs --no-tty --no-interactive foodchain'
+    alias tel='${script_name} --sshfs --no-tty --no-interactive tel'
+    alias create_archives_db='${script_name} --sshfs create_archives_db'
+    alias query_archives_db='${script_name} query_archives_db'
+
+    # bz-login prompts an interactive login and set a local token for subsequent queries
+    # The token can be found in ~/.cache/python-bugzilla/bugzillatoken
+    alias bz-login='bugzilla --bugzilla https://bugzilla.suse.com login'
+
+    alias php='${script_name} php'
+    alias phar='${script_name} phar'
+    type secret-tool 2>/dev/null 1>&2 || alias secret-tool='${script_name} --no-tty secret-tool'
+    type ldapsearch 2>/dev/null 1>&2 || alias ldapsearch='${script_name} ldapsearch'
+else
+    ########## INSIDE THE CONTAINER ##########
+    export PS1=\"\u@${script_name} \W> \"
+    alias ${script_name}='echo You cannot execute ${script_name} inside the $container container; false'
+fi
+"
+}
+
+enable_container_service() {
+# Configure the container to start at boot
+
+    # Create systemd user's folder if don't exists
+    mkdir -p "${container_unit%/*}" > /dev/null 2>&1
+    # If systemd unit does not exist, create it
+    systemctl --user status ${container}.service >/dev/null 2>&1 || {
+        if podman generate systemd --name $container > "$container_unit"; then
+            #####
+            # FIXME: To be removed once the fix end to the upstream. Workaround for: 
+            # https://github.com/containers/podman/issues/8506#issuecomment-735442979
+            sed -e '/^PID/s/^/#/' -i "$container_unit"
+            #####
+        else
+            msg "${orange}[*]${no_format} Cannot create ${container}.service"
+        fi
+
+        systemctl --user daemon-reload
+    }
+
+    systemctl --user is-enabled --quiet ${container}.service ||
+        systemctl --user enable ${container}.service > /dev/null 2>&1
+}
+
+suse_internal_network() {
+    # Check if VPN connection is available, fail if any of the following end-point is not reachable
+    local -ar _know_internal_addresses=(
+        # Check reachability of login's ssh service, since it likely has best uptime
+        "10.144.39.65/22"
+        # dns lookup can introduce a very long delay when the dns server is not
+        # reachable, so I test domain name resolution only if the above worked
+        "login.suse.de/22"
+    )
+
+    for _address in "${_know_internal_addresses[@]}"; do
+        # Fail at first connection that can't be estabilished
+        timeout 1 sh -c "echo > /dev/tcp/${_address}" >/dev/null 2>&1 || return
+    done
+}
+
+secbox_instances_using_sshfs() {
+    local _instances=0
+    _instances=$(pgrep --count --full "${container}.* --sshfs")
+    echo "$_instances"
+}
+
+other_secbox_instances() {
+    local _instances=0
+    _instances=$(pgrep --count --full "podman .*${container}")
+    echo "$_instances"
+}
+
+sudo_privs() {
+    sudo -nv >/dev/null 2>&1
+}
+
+sshfs_exists() {
+    podman container exec $container sshfs --version > /dev/null 2>&1
+}
+
+sshfs_is_mounted() {
+    podman container exec $container mount | grep "on /mounts type fuse.sshfs" > /dev/null 2>&1 || return 1
+    podman container exec $container mount | grep "on /suse type fuse.sshfs" > /dev/null 2>&1 || return 1
+}
+
+sshfs_mount() {
+    sshfs_exists || {
+        msg "${orange}[*]${no_format} ${container} sshfs is not installed in the container"
+        return 1
+    }
+
+    podman container exec -d $container mkdir -p /mounts > /dev/null 2>&1
+    podman >/dev/null 2>&1 container exec --env-file="$host_env" -d $container sshfs -o ro,StrictHostKeyChecking=no,compression=yes dist:/mounts /mounts
+    podman container exec -d $container mkdir -p /suse > /dev/null 2>&1
+    podman >/dev/null 2>&1 container exec --env-file="$host_env" -d $container sshfs -o ro,StrictHostKeyChecking=no,compression=yes dist:/suse   /suse
+}
+
+sshfs_umount() {
+    podman container exec -d $container fusermount3 -uz /mounts > /dev/null 2>&1 ||
+        msg "${orange}[*]${no_format} ${container} cannot umount sshfs mountpoint: /mounts"
+    podman container exec -d $container fusermount3 -uz /suse > /dev/null 2>&1 ||
+        msg "${orange}[*]${no_format} ${container} cannot umount sshfs mountpoint: /suse"
+}
+
+fuse_access() {
+    [[ -c /dev/fuse ]] || {
+        msg "/dev/fuse does not exist"
+        return 1
+    }
+
+    # check permissions for "others" of the /dev/fuse special character file
+    local _others_permission=$(stat -L -c "%A" /dev/fuse | rev | cut -b -3 | rev)
+    if [[ ! $_others_permission =~ ^rw.$ ]]; then
+        # /dev/fuse is not usable by anyone
+        # check group permissions and check if we are part of that group
+        local _group_permission=$(stat -L -c "%A" /dev/fuse | cut -b 5- | cut -b -3)
+        local _gorup=$(stat -L -c "%g" /dev/fuse)
+        if [[ $_group_permission =~ ^rw.$ ]]; then
+            # /dev/fuse is usable by group users
+            local _g
+            for _g in $(id -G); do
+                [[ "${_g}" == "${_gorup}" ]] && return # if I'm part of that group (OK)
+            done
+        fi
+        msg "/dev/fuse cannot be accessed by ${USER}"
+        return 1
+    fi
+    # if here, then /dev/fuse exists and can be used by any user
+}
+
+mount_remote_volumes() {
+    if [[ -n $sshfs_flag ]] && ! sshfs_is_mounted; then
+        if ! ssh -qo "BatchMode=yes" dist exit; then
+            msg "${orange}[*]${no_format} ${container} cannot access dist via 'ssh dist'.
+    Please ensure you have properly configured dist in your ~/.ssh/config. A valid stanza should be like:
+    Host dist
+        HostName dist.suse.de
+        User <YOUR_USERNAME>
+        PreferredAuthentications publickey
+        IdentityFile /path/to/your/key
+    you could avoid IdentityFile in case your key is loaded in the ssh-agent, in this case ${script_name} will use it"
+        else
+            sshfs_mount &&
+                msg_to_secbox_sessions "==== Another ${script_name} instance has mounted dist:/mounts in /mounts ===="
+        fi
+    fi
+}
+
+secbox_container_exists() {
+    podman container exists $container
+}
+
+secbox_container_not_exists() {
+    secbox_container_exists && return 1 || return 0
+    # Toggled return value
+}
+
+create_container() {
+    podman image ls | grep -E "$image_name" >/dev/null 2>&1 || {
+        # If the image does not exist, pull it
+        msg "${orange}[*]${no_format} ${container} image not found"
+        read -ep "[.] Do you want to pull the image right now? [Y/n] " -n 1 -r
+        [[ $REPLY =~ ^[Nn]$ ]] &&
+            return 1
+        pull_image
+    }
+
+    local _image_version=$(local_most_recent_image_version)
+
+    # The volume ${tmp_dir}:${tmp_dir} (aka ${XDG_RUNTIME_DIR:-/tmp}) adds
+    # some usefull capabilities to the container, the most used ones (for me) are:
+    #  - Access D-Bus session socket
+    #    * This is used by osc to query the secret service provider to get creds to login to OBS instances
+    #  - Folders created via mkcd (alias) can be accessed from the container, hence I can use them with its tools
+    #    * mkcd: https://github.com/StayPirate/dotfiles/blob/04b556b42df2d2a31ffee7247897c7b3229c7675/.zshrc#L117
+
+    local _podman_cmdline="podman container create \
+                            --name ${container} \
+                            --userns=keep-id \
+                            -u $(id -u) \
+                            --network host \
+                            --dns=none \
+                            -v \"$(readlink -e "${BASH_SOURCE[0]}"):/usr/bin/secbox\" \
+                            -v ${resolv_conf}:/etc/resolv.conf:ro \
+                            -v ${tmp_dir}:${tmp_dir} \
+                            -v ${HOME}:${HOME} \
+                            -w ${HOME}"
+
+    [[ "$tmp_dir" != "/tmp" ]] && _podman_cmdline="${_podman_cmdline} -v /tmp:/tmp"
+
+    # SYS_ADMIN capabilities are added to use FUSE from the container in order to mount sshfs, keep in mind
+    # that this is a rootless container, hence not all SYS_ADMIN capabilites are available from the container
+    if fuse_access; then
+        _podman_cmdline="${_podman_cmdline} --device /dev/fuse --cap-add SYS_ADMIN"
+    else
+        msg "${orange}[*]${no_format} fuse not available, --sshfs option will not work"
+    fi
+
+    _podman_cmdline="${_podman_cmdline} \
+                     ${registry}/${image_name}:${_image_version}"
+
+    eval "$_podman_cmdline" > /dev/null 2>&1 || return
+    enable_container_service
+}
+
+start_container() {
+    secbox_container_not_exists && {
+        # If the container does not exist, create it
+        print_logo
+        msg "${orange}[*]${no_format} ${container} container not found"
+        create_container || {
+            msg "${red}[!]${no_format} Cannot create the ${container} container"
+            return 1
+        }
+        msg "${green}[.] ${no_format}${container} container created\n"
+    }
+
+    systemctl --user is-active --quiet $container.service >/dev/null 2>&1
+    local _service_status=$?
+    if [[ $_service_status == "3" ]]; then
+        systemctl --user restart $container.service >/dev/null 2>&1
+    else
+        return $_service_status
+    fi
+}
+
+local_image_container_version() {
+    local _version=''
+    secbox_container_exists && {
+        _version=$(podman container inspect --format '{{.ImageName}}' $container | cut -d ":" -f 2)
+    }
+    echo "$_version"
+}
+
+local_most_recent_image_version() {
+    local _version=''
+    _version=$(podman image ls 2>/dev/null | grep secbox | awk '{print $2}' | sort -Vr | head -1)
+    echo "$_version"
+}
+
+upstream_image_version() {
+    local _version=''
+    _version=$(curl -LsSf ${registry_api}${image_name}/tags/list 2>/dev/null | \
+               awk -F '"tags"' {'print $2'} | \
+               cut -d "]" -f 1 | \
+               grep -Eo "[0-9.]+")
+    echo "$_version"
+}
+
+pull_image() {
+    suse_internal_network || return
+    local _upstream=$(upstream_image_version)
+    if podman pull "${registry}/${image_name}:${_upstream:-}" >/dev/null 2>&1; then
+        msg "${green}[*]${no_format} ${registry}/${image_name} v.${_upstream:-} downloaded"
+    else
+        msg "${red}[!]${no_format} cannot pull the image"
+        return 1
+    fi
+}
+
+update_image() {
+    if [[ "${1:-}" != "" ]]; then
+        [[ "${1:-}" != "-f" && "${1:-}" != "--force" ]] && die "${1:-} not a valid flag"
+        msg "[.] You are going to replace the current ${container} container with a new one which will use"
+        read -ep "    the latest build of the container-image. Do you want to proceed? [Y/n] " -n 1 -r
+    else
+        update_available
+        local _update_available=$?
+        case "${_update_available}" in
+            2) msg "${orange}[*]${no_format} No local image found, the most recent one is going to be downloaded.\n    Please wait, it can take a while."
+               pull_image
+               ;;
+            1) die "Your container is up-to-date, nothing to do here." ;;
+        esac
+        local _upstream=$(upstream_image_version)
+        msg "[.] A container update is available, do you want to update it now? [Y/n]"
+        read -ep "    Changelog: https://gitlab.suse.de/security/secbox-image/-/tags/v${_upstream} " -n 1 -r
+    fi
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        secbox_container_exists && secbox_destroy -f -i
+        create_container
+        start_container
+    else
+        # Update denied by the user
+        return 0
+    fi
+    # Something wrong happened
+    return 1
+}
+
+update_available() {
+    local _local_version=''
+    local _version_in_use=''
+    local _higher_version=''
+    _version_in_use=$(local_image_container_version)
+    local _local_most_recent_image=$(local_most_recent_image_version)
+    local _upstream_version=$(upstream_image_version)
+
+    [[ -z $_version_in_use ]] && _local_version=${_local_most_recent_image:-} || _local_version=${_version_in_use:-}
+
+    # If there's no any local image, then return 2
+    [[ ${_local_version:-} == "" ]] && return 2
+    # Check if versions are numbers (integer or floating point)
+    [[ "${_upstream_version:-}" =~ ^[0-9.]+$ && "${_local_version:-}" =~ ^[0-9.]+$ ]] || return 1
+
+    _higher_version=$(echo -e "${_upstream_version}\n${_local_version}" | sort -Vr | head -n 1)
+    [ "${_higher_version}" == "${_local_version}" ] && return 1
+    return 0
+}
+
+systemd_service_is_enabled() {
+    systemctl --user is-enabled --quiet ${container}.service
+}
+
+systemd_service_is_disabled() {
+    systemd_service_is_enabled && return 1 || return 0
+    # Toggled return value
+}
+
+container_is_running() {
+    podman container ls --all | grep -qE "Up.*${container}"
+}
+
+container_is_not_running() {
+    container_is_running && return 1 || return 0
+    # Toggled return value
+}
+
+sync_name_resolvers() {
+    # I want the container resolv.conf reflect the one in the host. This would allow containerized binaries
+    # to resolve network resources in case the host resolvers are changed.
+    # An easiest solution would be to bind mount /etc/resolv.conf, but unfortunately NetworkManager replace
+    # this file instead of updating it in place, which in turn breaks the bind mount.
+    # This function is intended to maintain a custom file with the same content of the host's resolv.conf
+    #
+    # For more info: https://github.com/containers/podman/issues/11042
+    #                https://github.com/containers/podman/issues/10026
+    #                https://github.com/StayPirate/secbox/issues/5
+
+    cat /etc/resolv.conf > "$resolv_conf"
+}
+
+sync_host_env() {
+    echo -n > "$host_env"
+
+    set +u
+    for env_var in "${host_env_vars[@]}"; do
+        echo -n "$env_var=" >> "$host_env"
+        eval "echo \$$env_var" >> "$host_env"
+    done
+    for env_var in "${extra_env_vars[@]}"; do
+        echo "$env_var" >> "$host_env"
+    done
+    local container_id="$(podman container inspect --format '{{.Id}}' ${container})"
+    echo "secbox_container_id=${container_id}" >> "$host_env"
+    set -u
+}
+
+secbox_exec() {
+    # Podman misbehaves when pipes are involved, as reported here
+    # https://github.com/containers/podman/issues/9718#issuecomment-799925847
+    # Credits to @giuseppe who suggested a clever workaround (_ti)
+    ### tty 0<&1 &>/dev/null: use tty to test stdout instead of stdin :)
+
+    # Set if the tty should be set or not
+    # That can be forced with --tty or --no-tty
+    if [[ "$1" == "auto" ]]; then
+        local _t="-t"; tty 0<&1 &>/dev/null || _t=""
+    elif [[ "$1" == "false" ]]; then
+        local _t="";
+    elif [[ "$1" == "true" ]]; then
+        local _t="-t";
+    fi
+    shift
+
+    # Set if the shell should be interactive or not
+    # That can be forced with --interactive or --no-interactive
+    if [[ "$1" == "auto" ]]; then
+        local _i="-i"; tty 0<&1 &>/dev/null || _i=""
+    elif [[ "$1" == "false" ]]; then
+        local _i="";
+    elif [[ "$1" == "true" ]]; then
+        local _i="-i";
+    fi
+    shift
+
+    podman container exec $_t $_i -w "$(pwd)" --env-file="$host_env" $container "$@"
+}
+
+secbox_destroy(){
+    secbox_container_exists || die "${orange}[*]${no_format} ${container} does not exist"
+
+    if [[ $(other_secbox_instances) -gt 0 ]]; then
+        die "${orange}[*]${no_format} Destruction aborted: other ${script_name} instances are using the container"
+    fi
+
+    print_logo
+
+    # -f bypasses the interactive prompt
+    if [[ "${1:-}" != "-f" ]]; then
+        read -ep "[.] Do you really want to destroy ${container} [y/N] " -n 1 -r
+        [[ $REPLY =~ ^[Yy]$ ]] || die "${orange}[*]${no_format} Destruction aborted."
+    else
+        shift
+    fi
+
+    systemctl --user daemon-reload
+    # Stop container if it's running
+    if systemctl --user is-active --quiet $container.service >/dev/null 2>&1; then
+        systemctl --user stop --quiet $container.service && msg "${green}[.]${no_format} container stopped"
+    fi
+    # Disable container autostart at boot
+    if systemctl --user is-enabled --quiet ${container}.service >/dev/null 2>&1; then
+        systemctl --user disable ${container}.service > /dev/null 2>&1 && msg "${green}[.]${no_format} container autostart disabled"
+    fi
+    # Remove systemd unit
+    if [[ -f "$container_unit" ]]; then
+        rm "$container_unit"
+        systemctl --user daemon-reload
+    fi
+
+    local _image_id=$(local_image_container_version) # Get the container's image id
+    if podman container rm -f ${container} > /dev/null 2>&1; then
+        msg "${green}[.]${no_format} ${container} container deleted"
+        # If -i flag exists, then remove image used by the deleted container
+        if [[ -n "${_image_id:-}" ]] && [[ "${1:-}" == "-i" ]]; then
+            podman image rm "${registry}/${image_name}:${_image_id:-}" > /dev/null 2>&1 &&
+                msg "${green}[.]${no_format} ${container} image deleted"
+        fi
+    else
+        msg "${red}[!]${no_format} ${container} container cannot be deleted"
+        return 1
+    fi
+
+    # Do not delete the local file structure during an update, but
+    # only when the user intentionally use the --destroy flag
+    [[ "${FUNCNAME[1]}" != "update_image" ]] && remove_base_structure || true
+}
+
+secbox_root() {
+    secbox_container_exists || die "${red}[!]${no_format} ${container} container does not exist"
+
+    msg "${red}"
+    echo -e "    !!!\t                          ~ Be CaReFuL ~\t!!!
+    !!!\t${container} is a rootless container, that means this root user is mapped\t!!!
+    !!!\twith your host $USER account. While you can install any package\t!!!
+    !!!\tor change any container's file, DO NOT FORGET that your host-user's\t!!!
+    !!!\tHOME directory is shared with this container. Any change performed\t!!!
+    !!!\tin /home/$USER is reflected to your host filesystem.\t!!!
+    !!!\tIn case you messed up the container, DON'T PANIC! Just destroy and\t!!!
+    !!!\trecreate it '${container} --destroy' and '${container} echo Hello World'\t!!!
+    !!!\t                          ~ Be CaReFuL ~\t!!!" | column -t -s $'\t'
+    msg "${no_format}"
+    podman container exec --env-file="$host_env" -ti --user 0 $container bash
+}
+
+main() {
+
+    while :; do
+        case "${1:-}" in
+            -h | --help | help | "") print_help; exit ;;
+            -v | --version) print_version; exit ;;
+            --alias) aliases; exit ;;
+            *) break ;;
+        esac
+        shift
+    done
+
+    setup_colors
+
+    type podman >/dev/null 2>&1 ||
+        die "${red}[!]${no_format} Container engine missing: podman is required"
+
+    if [[ $EUID -eq 0 ]]; then
+        msg "Are you sure you want to run secbox from root?"
+    else
+        if ! (grep -q "$(id -nu)" /etc/subuid && grep -q "$(id -nu)" /etc/subgid); then
+            die "${red}[!]${no_format} Podman is not configured to run rootless containers, please configure it first.
+    https://github.com/containers/podman/blob/master/docs/tutorials/rootless_tutorial.md"
+        fi
+    fi
+
+    sshfs_flag=''
+    tty='auto'
+    interactive='auto'
+
+    while :; do
+        case "${1:-}" in
+            --debug) set -x ;;
+            --destroy) secbox_destroy "${2:-}" "${3:-}"; exit ;;
+            --update-container) update_image "${2:-}"; echo && print_version; exit ;;
+            --root) secbox_root; exit ;;
+            --no-color) no_color=1 && setup_colors ;;
+            --sshfs) sshfs_flag='true' ;;
+            --no-tty) tty='false' ;;
+            --tty) tty='true' ;;
+            --no-interactive) interactive='false' ;;
+            --interactive) interactive='true' ;;
+            -?*) die "${orange}Unknown option${no_format}: ${1:-}" 0 ;;
+            *) break ;;
+        esac
+        shift
+    done
+
+    create_base_structure
+
+    sync_name_resolvers
+
+    if suse_internal_network; then
+        update_available &&
+            msg "${yellow}[*]${no_format} A container update is available, use 'secbox --update-container' to update it."
+    fi
+
+    if container_is_not_running; then
+        start_container || die "${red}[!]${no_format} Cannot start the ${container} container"
+    fi
+
+    if systemd_service_is_disabled; then
+        enable_container_service || msg "${orange}[*]${no_format} Cannot enable ${container} service"
+    fi
+
+    sync_host_env
+
+    if suse_internal_network; then
+        mount_remote_volumes
+    fi
+
+    secbox_exec "$tty" "$interactive" "$@"
+}
+
+main "$@"
